@@ -288,7 +288,7 @@ class Operation(Node):
         self._num_resets = 0
         self._delayed_outputs = DelayedOutputCache(self.id, store)
 
-    def acquire(self, n, starting=0, batch_size=None):
+    def acquire(self, n, starting=0, batch_size=None, **kwargs):
         """Acquires values from the start or from starting index.
         Generates new ones if needed and updates the _generate_index.
 
@@ -305,7 +305,7 @@ class Operation(Node):
         """
         sl = slice(starting, starting+n)
         if self._generate_index < sl.stop:
-            self.generate(sl.stop - self._generate_index, batch_size=batch_size)
+            self.generate(sl.stop - self._generate_index, batch_size=batch_size, **kwargs)
         return self.get_slice(sl)
 
     # TODO: better documentation for `with_values`

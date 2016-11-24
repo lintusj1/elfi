@@ -76,7 +76,7 @@ class ABCMethod(object):
         """
         raise NotImplementedError("Subclass implements")
 
-    def _get_distances(self, n_samples):
+    def _get_distances(self, n_samples, **kwargs):
         """Run the all-accepting sampler.
 
         Parameters
@@ -91,10 +91,9 @@ class ABCMethod(object):
         parameters: list containing np.ndarrays of shapes (n_samples, ...)
             Contains parameter values for each parameter node in order
         """
-        distances = self.distance_node.acquire(n_samples, batch_size=self.batch_size).compute()
-        parameters = [p.acquire(n_samples, batch_size=self.batch_size).compute()
+        distances = self.distance_node.acquire(n_samples, batch_size=self.batch_size, **kwargs).compute()
+        parameters = [p.acquire(n_samples, batch_size=self.batch_size, **kwargs).compute()
                       for p in self.parameter_nodes]
-
         return distances, parameters
 
 
@@ -102,7 +101,7 @@ class Rejection(ABCMethod):
     """Rejection sampler.
     """
 
-    def sample(self, n_samples, quantile=0.01, threshold=None):
+    def sample(self, n_samples, quantile=0.01, threshold=None, **kwargs):
         """Run the rejection sampler.
 
         In quantile mode, the simulator is run (n/quantile) times.
@@ -216,7 +215,7 @@ class SMC(Rejection):
     `Rejection` : Basic rejection sampling.
     """
 
-    def sample(self, n_samples, n_populations, schedule):
+    def sample(self, n_samples, n_populations, schedule, proposal_distribution=ss.norm):
         """Run SMC-ABC sampler.
 
         Parameters
@@ -227,6 +226,8 @@ class SMC(Rejection):
             Number of particle populations to iterate over.
         schedule : iterable of floats in range ]0, 1]
             Acceptance quantiles for particle populations.
+        proposal_distribution : A class with methods rvs and pdf
+            Proposal distribution for particle populations.
 
         Returns
         -------
@@ -244,51 +245,67 @@ class SMC(Rejection):
         parameters = result['samples']
         weights = np.ones(n_samples)
 
-        # save original priors using deepcopy to capture possible conditionality
-        orig_priors = copy.deepcopy(self.parameter_nodes)
-
         params_history = []
         weighted_sds_history = []
-        try:  # Try is used, since Priors will change. The `finally` part always reverts to original.
-            for tt in range(1, n_populations):
-                params_history.append(parameters)
+        for tt in range(1, n_populations):
 
-                weights /= np.sum(weights)  # normalize weights here
+            params_history.append(parameters)
+            n_proposals = n_samples / schedule[tt]
 
-                # calculate weighted standard deviations
-                weighted_sds = [ np.sqrt( 2. * weighted_var(p, weights) )
-                                 for p in parameters ]
-                weighted_sds_history.append(weighted_sds)
+            weights /= np.sum(weights)  # normalize weights here
 
-                # set new prior distributions based on previous samples
-                for ii, p in enumerate(self.parameter_nodes):
-                    pname = "{}_smc{}".format(p.name, tt)
-                    new_prior = Prior(pname, SMC_Distribution, parameters[ii],
-                                      weighted_sds[ii], weights)
-                    self.parameter_nodes[ii] = p.change_to(new_prior,
-                                                           transfer_parents=False,
-                                                           transfer_children=True)
+            # calculate weighted standard deviations
+            weighted_sds = [ np.sqrt( 2. * weighted_var(p, weights) )
+                             for p in parameters ]
+            weighted_sds_history.append(weighted_sds)
 
-                # rejection sampling with the new priors
-                result = super(SMC, self).sample(n_samples, quantile=schedule[tt])
-                parameters = result['samples']
+            # FIXME: consistency
+            random_state = np.random.RandomState(0)
+            random_state.set_state(self.parameter_nodes[0]._get_random_state().compute())
 
-                # calculate new unnormalized weights for parameters
-                weights_new = np.ones(n_samples)
-                for ii in range(self.n_params):
-                    weights_denom = np.sum(weights *
-                                           self.parameter_nodes[ii].pdf(parameters[ii]).T)
+            # set proposals for the next population
+            ind_range = np.arange(n_samples, dtype=np.int32)
+            selected_inds = random_state.choice(a=ind_range, size=n_proposals, p=weights)
+            with_values_dict = {}
+            for ii, p in enumerate(self.parameter_nodes):
 
-                    weights_new *= orig_priors[ii].pdf(parameters[ii], all_samples=parameters).ravel()
-                    weights_new /= weights_denom
-                weights = weights_new
+                proposals = parameters[ii][selected_inds,:]
+                inds = np.arange(n_proposals, dtype=np.int32)
+                while len(inds) > 0:
+                    size = (len(inds), *proposals.shape[1:])
+                    noise = proposal_distribution.rvs(scale=weighted_sds[ii], size=size,
+                                                      random_state=random_state)
+                    conditional_dict = {key: with_values_dict[key][inds, :]
+                                        for key in with_values_dict.keys()}
+                    ok = (p.pdf(proposals[inds, :] + noise, with_values=conditional_dict) > 0).ravel()
+                    proposals[inds[ok], :] += noise[ok, :]
+                    inds = inds[np.invert(ok)]
+                    # if (len(inds) < 10):
+                    #     print(len(inds), 'noise', noise.ravel(), 'props', proposals[inds, :].ravel())
 
-        finally:
-            # revert to original priors
-            self.parameter_nodes = [p.change_to(orig_priors[ii],
-                                                transfer_parents=False,
-                                                transfer_children=True)
-                                    for ii, p in enumerate(self.parameter_nodes)]
+                with_values_dict[p.name] = proposals
+
+            for p in self.parameter_nodes:
+                p.reset(propagate=True)  # TODO: Do we need previous iterations?
+
+            # FIXME: does random_state have to be updated in core?
+
+            # rejection sampling with these proposals and the scheduled quantile
+            result = super(SMC, self).sample(n_samples, quantile=schedule[tt], with_values=with_values_dict)
+            parameters = result['samples']
+            with_values_dict = {p.name: parameters[ii] for ii, p in enumerate(self.parameter_nodes)}
+
+            # calculate new unnormalized weights for parameters
+            weights_new = np.ones(n_samples)
+            for ii, p in enumerate(self.parameter_nodes):
+                x = parameters[ii]
+                loc = params_history[-1][ii]
+                scale = weighted_sds[ii]
+                weights_denom = np.sum(weights * proposal_distribution.pdf(x, loc=loc, scale=scale).T)
+
+                weights_new *= p.pdf(parameters[ii], with_values=with_values_dict).ravel()
+                weights_new /= weights_denom
+            weights = weights_new
 
         return {'samples': parameters,
                 'samples_history': params_history,

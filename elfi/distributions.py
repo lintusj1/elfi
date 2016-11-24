@@ -116,7 +116,7 @@ class ScipyRV(core.RandomStateMixin, core.Operation):
         """
         # TODO: think of a more general solution.
         if not self.is_conditional:
-            kwargs.pop('all_samples', None)
+            kwargs.pop('with_values', None)
         return kwargs
 
 
