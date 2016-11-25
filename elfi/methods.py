@@ -268,20 +268,19 @@ class SMC(Rejection):
             selected_inds = random_state.choice(a=ind_range, size=n_proposals, p=weights)
             with_values_dict = {}
             for ii, p in enumerate(self.parameter_nodes):
-
-                proposals = parameters[ii][selected_inds,:]
+                proposals = parameters[ii][selected_inds]
                 inds = np.arange(n_proposals, dtype=np.int32)
+
+                # require that proposals are possible with prior pdfs
                 while len(inds) > 0:
-                    size = (len(inds), *proposals.shape[1:])
+                    size = len(inds), *proposals.shape[1:]
                     noise = proposal_distribution.rvs(scale=weighted_sds[ii], size=size,
                                                       random_state=random_state)
-                    conditional_dict = {key: with_values_dict[key][inds, :]
+                    conditional_dict = {key: with_values_dict[key][inds]
                                         for key in with_values_dict.keys()}
-                    ok = (p.pdf(proposals[inds, :] + noise, with_values=conditional_dict) > 0).ravel()
-                    proposals[inds[ok], :] += noise[ok, :]
+                    ok = (p.pdf(proposals[inds] + noise, with_values=conditional_dict) > 0).ravel()
+                    proposals[inds[ok]] += noise[ok]
                     inds = inds[np.invert(ok)]
-                    # if (len(inds) < 10):
-                    #     print(len(inds), 'noise', noise.ravel(), 'props', proposals[inds, :].ravel())
 
                 with_values_dict[p.name] = proposals
 
