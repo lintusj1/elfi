@@ -1,4 +1,8 @@
 import uuid
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class Graph:
@@ -15,9 +19,22 @@ class Graph:
         self.nodes = {}
 
     def add_node(self, node):
+        """Adds a new node to graph. If a node with the same name already exists,
+        renames the old one.
+
+        Parameters
+        ----------
+        node : Node
+        """
         if node not in self.nodes.values():
             if node.name in self.nodes:
-                raise ValueError('Node name {} is already in use'.format(node.name))
+                name_old = node.name
+                while name_old in self.nodes:
+                    name_old += "_old"
+                logger.warning("Node with name {} exists. Renaming old to {}."
+                               .format(node.name, name_old))
+                self.nodes[node.name].rename(name_old)
+                self.nodes[name_old] = self.nodes[node.name]
             self.nodes[node.name] = node
 
     def remove_node(self, node):
@@ -50,6 +67,15 @@ class Node(object):
 
     def reset(self, *args, **kwargs):
         pass
+
+    def rename(self, name):
+        """Rename node.
+
+        Parameters
+        ----------
+        name : string
+        """
+        self.name = name
 
     def add_parents(self, nodes):
         """Add multiple parents at once. See also `add_parent`.
