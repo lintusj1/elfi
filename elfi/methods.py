@@ -10,18 +10,19 @@ import scipy.stats as ss
 import elfi
 from elfi import Discrepancy, Operation
 from elfi.async import wait
-from elfi.distributions import Prior, SMC_Distribution
 from elfi.posteriors import BolfiPosterior
 from elfi.utils import stochastic_optimization, weighted_var
 from elfi.bo.gpy_model import GPyModel
 from elfi.bo.acquisition import LCBAcquisition, SecondDerivativeNoiseMixin, RbfAtPendingPointsMixin
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 """Implementations of some ABC algorithms.
 
 ABCMethod : Base class
 Rejection : Rejection ABC (threshold or quantile-based)
+SMC       : Sequential Monte Carlo ABC
 BOLFI     : Bayesian optimization based ABC
 """
 
@@ -215,7 +216,7 @@ class SMC(Rejection):
     `Rejection` : Basic rejection sampling.
     """
 
-    def sample(self, n_samples, n_populations, schedule, proposal_distribution=ss.norm):
+    def sample(self, n_samples, n_populations, schedule, noise_dist=ss.norm):
         """Run SMC-ABC sampler.
 
         Parameters
@@ -226,8 +227,8 @@ class SMC(Rejection):
             Number of particle populations to iterate over.
         schedule : iterable of floats in range ]0, 1]
             Acceptance quantiles for particle populations.
-        proposal_distribution : A class with methods rvs and pdf
-            Proposal distribution for particle populations.
+        noise_dist : A class with methods rvs and pdf
+            Distribution for the added noise in proposed particle populations.
 
         Returns
         -------
@@ -250,7 +251,11 @@ class SMC(Rejection):
         for tt in range(1, n_populations):
 
             params_history.append(parameters)
-            n_proposals = n_samples / schedule[tt]
+            n_proposals = int(n_samples / schedule[tt])
+
+            # init dictionary for proposals here
+            proposal_dict = {p.name: np.empty((n_proposals, *parameters[ii].shape[1:]))
+                             for ii, p in enumerate(self.parameter_nodes)}
 
             weights /= np.sum(weights)  # normalize weights here
 
@@ -259,30 +264,43 @@ class SMC(Rejection):
                              for p in parameters ]
             weighted_sds_history.append(weighted_sds)
 
-            # FIXME: consistency
+            # get random state from core for consistency
+            # FIXME: does this work properly?
             random_state = np.random.RandomState(0)
             random_state.set_state(self.parameter_nodes[0]._get_random_state().compute())
 
-            # set proposals for the next population
-            ind_range = np.arange(n_samples, dtype=np.int32)
-            selected_inds = random_state.choice(a=ind_range, size=n_proposals, p=weights)
-            with_values_dict = {}
-            for ii, p in enumerate(self.parameter_nodes):
-                proposals = parameters[ii][selected_inds]
-                inds = np.arange(n_proposals, dtype=np.int32)
+            ind_range = np.arange(n_samples, dtype=np.int32)  # for choosing from previous samples
+            inds = np.arange(n_proposals, dtype=np.int32)  # for keeping track of new proposals
 
-                # require that proposals are possible with prior pdfs
-                while len(inds) > 0:
-                    size = len(inds), *proposals.shape[1:]
-                    noise = proposal_distribution.rvs(scale=weighted_sds[ii], size=size,
-                                                      random_state=random_state)
-                    conditional_dict = {key: with_values_dict[key][inds]
-                                        for key in with_values_dict.keys()}
-                    ok = (p.pdf(proposals[inds] + noise, with_values=conditional_dict) > 0).ravel()
-                    proposals[inds[ok]] += noise[ok]
-                    inds = inds[np.invert(ok)]
+            # require that proposals are possible with prior pdfs
+            while len(inds) > 0:  # set proposals for the next population
+                n_inds = len(inds)  # new proposals left to choose
+                logger.debug("{}: Need {} new proposals."
+                             .format(self.__class__.__name__, n_inds))
 
-                with_values_dict[p.name] = proposals
+                chosen_inds = random_state.choice(a=ind_range, size=n_inds, p=weights)
+
+                subproposal_dict = {}
+
+                # add noise to chosen particles
+                for ii, p in enumerate(self.parameter_nodes):
+                    proposals = parameters[ii][chosen_inds]
+                    noise = noise_dist.rvs(scale=weighted_sds[ii], size=proposals.shape,
+                                           random_state=random_state)
+                    subproposal_dict[p.name] = proposals + noise
+
+                # verify that the chosen proposals are acceptable i.e. p > 0
+                ok = np.ones(n_inds, dtype=np.bool8)
+                for ii, p in enumerate(self.parameter_nodes):
+                    ok_1param = (p.pdf(subproposal_dict[p.name], with_values=subproposal_dict) > 0).ravel()
+                    ok = np.logical_and(ok, ok_1param)
+
+                # save the acceptable proposals
+                for ii, p in enumerate(self.parameter_nodes):
+                    proposal_dict[p.name][inds[ok]] = subproposal_dict[p.name][ok]
+
+                # indices to non-acceptable proposals
+                inds = inds[np.invert(ok)]
 
             for p in self.parameter_nodes:
                 p.reset(propagate=True)  # TODO: Do we need previous iterations?
@@ -290,7 +308,7 @@ class SMC(Rejection):
             # FIXME: does random_state have to be updated in core?
 
             # rejection sampling with these proposals and the scheduled quantile
-            result = super(SMC, self).sample(n_samples, quantile=schedule[tt], with_values=with_values_dict)
+            result = super(SMC, self).sample(n_samples, quantile=schedule[tt], with_values=proposal_dict)
             parameters = result['samples']
             with_values_dict = {p.name: parameters[ii] for ii, p in enumerate(self.parameter_nodes)}
 
@@ -300,9 +318,8 @@ class SMC(Rejection):
                 x = parameters[ii]
                 loc = params_history[-1][ii]
                 scale = weighted_sds[ii]
-                weights_denom = np.sum(weights * proposal_distribution.pdf(x, loc=loc, scale=scale).T)
-
-                weights_new *= p.pdf(parameters[ii], with_values=with_values_dict).ravel()
+                weights_denom = np.sum(weights * noise_dist.pdf(x, loc=loc.T, scale=scale), axis=1)
+                weights_new *= p.pdf(x, with_values=with_values_dict).ravel()
                 weights_new /= weights_denom
             weights = weights_new
 
