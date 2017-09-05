@@ -1,7 +1,5 @@
 """This module contains common inference methods."""
 
-__all__ = ['Rejection', 'SMC', 'BayesianOptimization', 'BOLFI']
-
 import logging
 from math import ceil
 
@@ -19,9 +17,11 @@ from elfi.methods.bo.utils import stochastic_optimization
 from elfi.methods.posteriors import BolfiPosterior
 from elfi.methods.results import BolfiSample, OptimizationResult, Sample, SmcSample
 from elfi.methods.utils import (GMDistribution, ModelPrior, arr2d_to_batch,
-                                batch_to_arr2d, ceil_to_batch_size, weighted_var)
+                                batch_to_arr2d, ceil_to_batch_size, weighted_var, OutputSift)
 from elfi.model.elfi_model import ComputationContext, ElfiModel, NodeReference
-from elfi.utils import is_array
+
+__all__ = ['Rejection', 'SMC', 'BayesianOptimization', 'BOLFI']
+
 
 logger = logging.getLogger(__name__)
 
@@ -410,7 +410,8 @@ class Rejection(Sampler):
 
     """
 
-    def __init__(self, model, discrepancy_name=None, output_names=None, **kwargs):
+    def __init__(self, model, discrepancy_name=None, output_names=None, max_sample_size=10000,
+                 **kwargs):
         """Initialize the Rejection sampler.
 
         Parameters
@@ -421,6 +422,9 @@ class Rejection(Sampler):
         output_names : list, optional
             Additional outputs from the model to be included in the inference result, e.g.
             corresponding summaries to the acquired samples
+        max_sample_size : int, optional
+            The maximum requestable sample size. Larger value requires more memory. Default is
+            10000.
         kwargs:
             See InferenceMethod
 
@@ -429,6 +433,7 @@ class Rejection(Sampler):
         output_names = [discrepancy_name] + model.parameter_names + (output_names or [])
         super(Rejection, self).__init__(model, output_names, **kwargs)
 
+        self.max_sample_size = max_sample_size
         self.discrepancy_name = discrepancy_name
 
     def set_objective(self, n_samples, threshold=None, quantile=None, n_sim=None):
@@ -450,7 +455,14 @@ class Rejection(Sampler):
         """
         if quantile is None and threshold is None and n_sim is None:
             quantile = .01
-        self.state = dict(samples=None, threshold=np.Inf, n_sim=0, accept_rate=1, n_batches=0)
+        self.state = dict(samples=None,
+                          threshold=np.Inf,
+                          n_sim=0,
+                          accept_rate=1,
+                          n_batches=0)
+        self.state['output_sift'] = OutputSift(self.output_names,
+                                               self.batch_size,
+                                               max_sample_size=self.max_sample_size)
 
         if quantile:
             n_sim = ceil(n_samples / quantile)
@@ -478,10 +490,7 @@ class Rejection(Sampler):
 
         """
         super(Rejection, self).update(batch, batch_index)
-        if self.state['samples'] is None:
-            # Lazy initialization of the outputs dict
-            self._init_samples_lazy(batch)
-        self._merge_batch(batch)
+        self.state['output_sift'].add_batch(batch, batch_index)
         self._update_state_meta()
         self._update_objective_n_batches()
 
@@ -503,53 +512,14 @@ class Rejection(Sampler):
 
         return Sample(outputs=outputs, **self._extract_result_kwargs())
 
-    def _init_samples_lazy(self, batch):
-        """Initialize the outputs dict based on the received batch."""
-        samples = {}
-        e_noarr = "Node {} output must be in a numpy array of length {} (batch_size)."
-        e_len = "Node {} output has array length {}. It should be equal to the batch size {}."
-
-        for node in self.output_names:
-            # Check the requested outputs
-            if node not in batch:
-                raise KeyError("Did not receive outputs for node {}".format(node))
-
-            nbatch = batch[node]
-            if not is_array(nbatch):
-                raise ValueError(e_noarr.format(node, self.batch_size))
-            elif len(nbatch) != self.batch_size:
-                raise ValueError(e_len.format(node, len(nbatch), self.batch_size))
-
-            # Prepare samples
-            shape = (self.objective['n_samples'] + self.batch_size, ) + nbatch.shape[1:]
-            dtype = nbatch.dtype
-
-            if node == self.discrepancy_name:
-                # Initialize the distances to inf
-                samples[node] = np.ones(shape, dtype=dtype) * np.inf
-            else:
-                samples[node] = np.empty(shape, dtype=dtype)
-
-        self.state['samples'] = samples
-
-    def _merge_batch(self, batch):
-        # TODO: add index vector so that you can recover the original order
-        samples = self.state['samples']
-        # Put the acquired samples to the end
-        for node, v in samples.items():
-            v[self.objective['n_samples']:] = batch[node]
-
-        # Sort the smallest to the beginning
-        sort_mask = np.argsort(samples[self.discrepancy_name], axis=0).ravel()
-        for k, v in samples.items():
-            v[:] = v[sort_mask]
-
     def _update_state_meta(self):
-        """Update `n_sim`, `threshold`, and `accept_rate`."""
-        o = self.objective
-        s = self.state
-        s['threshold'] = s['samples'][self.discrepancy_name][o['n_samples'] - 1].item()
-        s['accept_rate'] = min(1, o['n_samples'] / s['n_sim'])
+        """Update ``threshold``, and ``accept_rate``."""
+        output_sift = self.state['output_sift']
+        n_samples = self.objective['n_samples']
+        self.state['threshold'] = output_sift.get_threshold(n_samples)
+        self.state['accept_rate'] = output_sift.get_accept_rate(n_samples)
+        # For backwards compatibility
+        self.state['samples'] = output_sift.get_outputs(n_samples)
 
     def _update_objective_n_batches(self):
         # Only in the case that the threshold is used
