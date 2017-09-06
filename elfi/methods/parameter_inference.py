@@ -1,6 +1,7 @@
 """This module contains common inference methods."""
 
 import logging
+import warnings
 from math import ceil
 
 import matplotlib.pyplot as plt
@@ -15,9 +16,9 @@ from elfi.methods.bo.acquisition import LCBSC
 from elfi.methods.bo.gpy_regression import GPyRegression
 from elfi.methods.bo.utils import stochastic_optimization
 from elfi.methods.posteriors import BolfiPosterior
-from elfi.methods.results import BolfiSample, OptimizationResult, Sample, SmcSample
+from elfi.methods.results import BolfiSample, OptimizationResult, Sample, SmcSample, OutputSampleCollector
 from elfi.methods.utils import (GMDistribution, ModelPrior, arr2d_to_batch,
-                                batch_to_arr2d, ceil_to_batch_size, weighted_var, OutputSift)
+                                batch_to_arr2d, ceil_to_batch_size, weighted_var)
 from elfi.model.elfi_model import ComputationContext, ElfiModel, NodeReference
 
 __all__ = ['Rejection', 'SMC', 'BayesianOptimization', 'BOLFI']
@@ -49,7 +50,7 @@ class ParameterInference:
         needed. You must have a key ``n_batches`` here. By default the algorithm finished when
         the ``n_batches`` in the state dictionary is equal or greater to the corresponding
         objective value.
-    batches : elfi.client.BatchHandler
+    batch_handler : elfi.client.BatchHandler
         Helper class for submitting batches to the client and keeping track of their
         indexes.
     pool : elfi.store.OutputPool
@@ -92,39 +93,30 @@ class ParameterInference:
 
         self.model = model.copy()
         self.output_names = self._check_outputs(output_names)
-
         self.client = elfi.client.get_client()
+        self.context = ComputationContext(batch_size=batch_size, seed=seed, pool=pool)
+        self.batch_handler = elfi.client.BatchHandler(self.model,
+                                                      context=self.context,
+                                                      output_names=output_names,
+                                                      client=self.client)
+        self.max_parallel_batches = max_parallel_batches or self.client.num_cores or 1
+        self.n_sim = 0
 
-        # Prepare the computation_context
-        context = ComputationContext(batch_size=batch_size, seed=seed, pool=pool)
-        self.batches = elfi.client.BatchHandler(
-            self.model, context=context, output_names=output_names, client=self.client)
-        self.computation_context = context
-        self.max_parallel_batches = max_parallel_batches or self.client.num_cores
-
-        if self.max_parallel_batches <= 0:
-            msg = 'Value for max_parallel_batches ({}) must be at least one.'.format(
-                self.max_parallel_batches)
-            if self.client.num_cores == 0:
-                msg += ' Client has currently no workers available. Please make sure ' \
-                       'the cluster has fully started or set the max_parallel_batches ' \
-                       'parameter by hand.'
-            raise ValueError(msg)
-
-        # State and objective should contain all information needed to continue the
-        # inference after an iteration.
-        self.state = dict(n_sim=0, n_batches=0)
-        self.objective = dict()
+        if self.max_parallel_batches < 1:
+            raise ValueError('The value of max_parallel_batches must be at least 1.')
+        if self.client.num_cores < 1:
+            warnings.warn('The client has currently no workers available. Please ensure that it '
+                          'will receive workers before continuing')
 
     @property
     def pool(self):
         """Return the output pool of the inference."""
-        return self.computation_context.pool
+        return self.context.pool
 
     @property
     def seed(self):
         """Return the seed of the inference."""
-        return self.computation_context.seed
+        return self.context.seed
 
     @property
     def parameter_names(self):
@@ -134,22 +126,52 @@ class ParameterInference:
     @property
     def batch_size(self):
         """Return the current batch_size."""
-        return self.computation_context.batch_size
+        return self.context.batch_size
 
-    def set_objective(self, *args, **kwargs):
-        """Set the objective of the inference.
+    def iterate(self, total_limit=None):
+        """Advance the inference by one iteration.
 
-        This method sets the objective of the inference (values typically stored in the
-        `self.objective` dict).
+        This is a way to manually progress the inference. One iteration consists of
+        waiting and processing the result of the next batch in succession and possibly
+        submitting new batches.
+
+        Notes
+        -----
+        If the next batch is ready, it will be processed immediately and no new batches
+        are submitted.
+
+        New batches are submitted only while waiting for the next one to complete. There
+        will never be more batches submitted in parallel than the `max_parallel_batches`
+        setting allows.
 
         Returns
         -------
-        None
+        bool
+            Was a new batch processed?
+
 
         """
-        raise NotImplementedError
+        total_limit = total_limit or np.inf
+        if self.n_sim >= total_limit:
+            return False
 
-    def extract_result(self):
+        self.submit(total_limit)
+
+        if self.batch_handler.num_pending == 0:
+            # Basically we should not end up here
+            logger.warning('No batches to process in the queue. Please check max_parallel_batches '
+                           'is positive.')
+            return False
+
+        # Wait and handle the next ready batch in succession
+        batch, batch_index = self.batch_handler.wait_next()
+
+        logger.info('Processing batch %d' % batch_index)
+        self.update(batch, batch_index)
+
+        return True
+
+    def extract(self):
         """Prepare the result from the current state of the inference.
 
         ELFI calls this method in the end of the inference to return the result.
@@ -180,8 +202,7 @@ class ParameterInference:
         None
 
         """
-        self.state['n_batches'] += 1
-        self.state['n_sim'] += self.batch_size
+        self.n_sim += self.batch_size
 
     def prepare_new_batch(self, batch_index):
         """Prepare values for a new batch.
@@ -208,6 +229,19 @@ class ParameterInference:
         """
         pass
 
+    def submit(self, total_limit=None):
+        # Submit as many new batches as allowed but at most up to n_sim simulations
+        n_submits = 0
+
+        while self._allow_submit(self.batch_handler.next_index, total_limit):
+            logger.info("Submitting batch %d" % self.batch_handler.next_index)
+
+            next_batch = self.prepare_new_batch(self.batch_handler.next_index)
+            self.batch_handler.submit(next_batch)
+            n_submits += 1
+
+        return n_submits
+
     def plot_state(self, **kwargs):
         """Plot the current state of the algorithm.
 
@@ -231,97 +265,15 @@ class ParameterInference:
         """
         raise NotImplementedError
 
-    def infer(self, *args, vis=None, **kwargs):
-        """Set the objective and start the iterate loop until the inference is finished.
+    def _allow_submit(self, batch_index, total_limit=None):
+        total_limit = total_limit or np.inf
+        n_pending = self.batch_handler.num_pending
 
-        See the other arguments from the `set_objective` method.
-
-        Returns
-        -------
-        result : Sample
-
-        """
-        vis_opt = vis if isinstance(vis, dict) else {}
-
-        self.set_objective(*args, **kwargs)
-
-        while not self.finished:
-            self.iterate()
-            if vis:
-                self.plot_state(interactive=True, **vis_opt)
-
-        self.batches.cancel_pending()
-        if vis:
-            self.plot_state(close=True, **vis_opt)
-
-        return self.extract_result()
-
-    def iterate(self):
-        """Advance the inference by one iteration.
-
-        This is a way to manually progress the inference. One iteration consists of
-        waiting and processing the result of the next batch in succession and possibly
-        submitting new batches.
-
-        Notes
-        -----
-        If the next batch is ready, it will be processed immediately and no new batches
-        are submitted.
-
-        New batches are submitted only while waiting for the next one to complete. There
-        will never be more batches submitted in parallel than the `max_parallel_batches`
-        setting allows.
-
-        Returns
-        -------
-        None
-
-        """
-        # Submit new batches if allowed
-        while self._allow_submit(self.batches.next_index):
-            next_batch = self.prepare_new_batch(self.batches.next_index)
-            logger.debug("Submitting batch %d" % self.batches.next_index)
-            self.batches.submit(next_batch)
-
-        # Handle the next ready batch in succession
-        batch, batch_index = self.batches.wait_next()
-        logger.debug('Received batch %d' % batch_index)
-        self.update(batch, batch_index)
-
-    @property
-    def finished(self):
-        return self._objective_n_batches <= self.state['n_batches']
-
-    def _allow_submit(self, batch_index):
-        return self.max_parallel_batches > self.batches.num_pending and \
-            self._has_batches_to_submit and \
-            (not self.batches.has_ready())
-
-    @property
-    def _has_batches_to_submit(self):
-        return self._objective_n_batches > \
-            self.state['n_batches'] + self.batches.num_pending
-
-    @property
-    def _objective_n_batches(self):
-        """Check that n_batches can be computed from the objective."""
-        if 'n_batches' in self.objective:
-            n_batches = self.objective['n_batches']
-        elif 'n_sim' in self.objective:
-            n_batches = ceil(self.objective['n_sim'] / self.batch_size)
-        else:
-            raise ValueError('Objective must define either `n_batches` or `n_sim`.')
-        return n_batches
-
-    def _extract_result_kwargs(self):
-        """Extract common arguments for the ParameterInferenceResult object."""
-        return {
-            'method_name': self.__class__.__name__,
-            'parameter_names': self.parameter_names,
-            'seed': self.seed,
-            'n_sim': self.state['n_sim'],
-            'n_batches': self.state['n_batches']
-        }
+        allow = True
+        allow &= self.max_parallel_batches > n_pending
+        allow &= total_limit > self.n_sim + n_pending
+        allow &= not self.batch_handler.has_ready()
+        return allow
 
     @staticmethod
     def _resolve_model(model, target, default_reference_class=NodeReference):
@@ -366,37 +318,11 @@ class ParameterInference:
         return checked_names
 
 
-class Sampler(ParameterInference):
-    def sample(self, n_samples, *args, **kwargs):
-        """Sample from the approximate posterior.
-
-        See the other arguments from the `set_objective` method.
-
-        Parameters
-        ----------
-        n_samples : int
-            Number of samples to generate from the (approximate) posterior
-        *args
-        **kwargs
-
-        Returns
-        -------
-        result : Sample
-
-        """
-        return self.infer(n_samples, *args, **kwargs)
-
-    def _extract_result_kwargs(self):
-        kwargs = super(Sampler, self)._extract_result_kwargs()
-        for state_key in ['threshold', 'accept_rate']:
-            if state_key in self.state:
-                kwargs[state_key] = self.state[state_key]
-        if hasattr(self, 'discrepancy_name'):
-            kwargs['discrepancy_name'] = self.discrepancy_name
-        return kwargs
+class ABCSampler(ParameterInference):
+    pass
 
 
-class Rejection(Sampler):
+class Rejection(ABCSampler):
     """Parallel ABC rejection sampler.
 
     For a description of the rejection sampler and a general introduction to ABC, see e.g.
@@ -410,8 +336,8 @@ class Rejection(Sampler):
 
     """
 
-    def __init__(self, model, discrepancy_name=None, output_names=None, max_sample_size=10000,
-                 **kwargs):
+    def __init__(self, model, discrepancy_name=None, output_names=None, sample_sizes=None,
+                 max_sample_size=None, **kwargs):
         """Initialize the Rejection sampler.
 
         Parameters
@@ -422,21 +348,31 @@ class Rejection(Sampler):
         output_names : list, optional
             Additional outputs from the model to be included in the inference result, e.g.
             corresponding summaries to the acquired samples
+        sample_sizes : list[int], optional
+            Sample sizes that we wish to track the threshold for. Calling the ``threshold`` method
+            will return a tuple listing the thresholds for the respective sample sizes. Default
+            is [1, max_sample_size].
         max_sample_size : int, optional
-            The maximum requestable sample size. Larger value requires more memory. Default is
-            10000.
+            The maximum sample size that can be extracted. Larger value requires more memory.
+            Default is the maximum among 10000, batch_size and max(sample_sizes).
         kwargs:
             See InferenceMethod
 
         """
         model, discrepancy_name = self._resolve_model(model, discrepancy_name)
         output_names = [discrepancy_name] + model.parameter_names + (output_names or [])
+
         super(Rejection, self).__init__(model, output_names, **kwargs)
 
-        self.max_sample_size = max_sample_size
         self.discrepancy_name = discrepancy_name
+        self.max_sample_size = max(self.batch_size, max(sample_sizes or [1000]))
+        self.sample_sizes = sample_sizes or [1, self.max_sample_size]  # type: list
+        self.sample_points = OutputSampleCollector(self.output_names,
+                                                   self.parameter_names,
+                                                   self.batch_size,
+                                                   max_sample_size=self.max_sample_size)
 
-    def set_objective(self, n_samples, threshold=None, quantile=None, n_sim=None):
+    def sample(self, n_samples, threshold=None, quantile=None, n_sim=None):
         """Set objective for inference.
 
         Parameters
@@ -453,30 +389,22 @@ class Rejection(Sampler):
             discrepancy among n_sim simulations.
 
         """
-        if quantile is None and threshold is None and n_sim is None:
-            quantile = .01
-        self.state = dict(samples=None,
-                          threshold=np.Inf,
-                          n_sim=0,
-                          accept_rate=1,
-                          n_batches=0)
-        self.state['output_sift'] = OutputSift(self.output_names,
-                                               self.batch_size,
-                                               max_sample_size=self.max_sample_size)
-
-        if quantile:
+        if threshold is not None:
+            n_sim = self.max_parallel_batches*self.batch_size
+        elif quantile is not None:
+            threshold = np.inf
             n_sim = ceil(n_samples / quantile)
-
-        # Set initial n_batches estimate
-        if n_sim:
-            n_batches = ceil(n_sim / self.batch_size)
+        elif n_sim is not None:
+            threshold = np.inf
         else:
-            n_batches = self.max_parallel_batches
+            raise ValueError('No threshold, quantile or n_sim provided.')
 
-        self.objective = dict(n_samples=n_samples, threshold=threshold, n_batches=n_batches)
+        while self.iterate(n_sim):
+            # If threshold, keep simulating until the threshold is reached
+            if threshold < self.sample_points.threshold_at(n_samples):
+                n_sim += self.batch_size
 
-        # Reset the inference
-        self.batches.reset()
+        return self.extract(n_samples)
 
     def update(self, batch, batch_index):
         """Update the inference state with a new batch.
@@ -490,82 +418,52 @@ class Rejection(Sampler):
 
         """
         super(Rejection, self).update(batch, batch_index)
-        self.state['output_sift'].add_batch(batch, batch_index)
-        self._update_state_meta()
-        self._update_objective_n_batches()
+        self.sample_points.add_batch(batch, batch_index)
 
-    def extract_result(self):
-        """Extract the result from the current state.
+    @property
+    def thresholds(self):
+        """Returns the thresholds for ``self.sample_sizes``."""
+        return tuple([self.sample_points.threshold_at(s) for s in self.sample_sizes])
+
+    def extract(self, n_samples=None):
+        """Extracts a sample with the current threshold.
 
         Returns
         -------
         result : Sample
 
         """
-        if self.state['samples'] is None:
-            raise ValueError('Nothing to extract')
+        n_samples = n_samples or self.max_sample_size
 
-        # Take out the correct number of samples
-        outputs = dict()
-        for k, v in self.state['samples'].items():
-            outputs[k] = v[:self.objective['n_samples']]
-
-        return Sample(outputs=outputs, **self._extract_result_kwargs())
-
-    def _update_state_meta(self):
-        """Update ``threshold``, and ``accept_rate``."""
-        output_sift = self.state['output_sift']
-        n_samples = self.objective['n_samples']
-        self.state['threshold'] = output_sift.get_threshold(n_samples)
-        self.state['accept_rate'] = output_sift.get_accept_rate(n_samples)
-        # For backwards compatibility
-        self.state['samples'] = output_sift.get_outputs(n_samples)
-
-    def _update_objective_n_batches(self):
-        # Only in the case that the threshold is used
-        if not self.objective.get('threshold'):
-            return
-
-        s = self.state
-        t, n_samples = [self.objective.get(k) for k in ('threshold', 'n_samples')]
-
-        # noinspection PyTypeChecker
-        n_acceptable = np.sum(s['samples'][self.discrepancy_name] <= t) if s['samples'] else 0
-        if n_acceptable == 0:
-            # No acceptable samples found yet, increase n_batches of objective by one in
-            # order to keep simulating
-            n_batches = self.objective['n_batches'] + 1
-        else:
-            accept_rate_t = n_acceptable / s['n_sim']
-            # Add some margin to estimated n_batches. One could also use confidence
-            # bounds here
-            margin = .2 * self.batch_size * int(n_acceptable < n_samples)
-            n_batches = (n_samples / accept_rate_t + margin) / self.batch_size
-            n_batches = ceil(n_batches)
-
-        self.objective['n_batches'] = n_batches
-        logger.debug('Estimated objective n_batches=%d' % self.objective['n_batches'])
+        return Sample(outputs=self.sample_points.outputs_at(n_samples, sorted=False),
+                      parameter_names=self.parameter_names,
+                      n_sim=self.n_sim,
+                      method_name=self.__class__.__name__,
+                      discrepancy_name=self.discrepancy_name,
+                      )
 
     def plot_state(self, **options):
         """Plot the current state of the inference algorithm.
 
         This feature is still experimental and only supports 1d or 2d cases.
         """
+        n_samples = self.sample_sizes[-1]
+
         displays = []
         if options.get('interactive'):
             from IPython import display
-            displays.append(
-                display.HTML('<span>Threshold: {}</span>'.format(self.state['threshold'])))
+            displays.append(display.HTML('<span>Thresholds: {}</span>'.
+                                         format(self.thresholds)))
 
         visin.plot_sample(
-            self.state['samples'],
+            self.sample_points.outputs,
             nodes=self.parameter_names,
-            n=self.objective['n_samples'],
+            n=n_samples,
             displays=displays,
             **options)
 
 
-class SMC(Sampler):
+class SMC(ABCSampler):
     """Sequential Monte Carlo ABC sampler."""
 
     def __init__(self, model, discrepancy_name=None, output_names=None, **kwargs):
@@ -636,7 +534,7 @@ class SMC(Sampler):
         self._rejection.update(batch, batch_index)
 
         if self._rejection.finished:
-            self.batches.cancel_pending()
+            self.batch_handler.cancel_pending()
             if self.state['round'] < self.objective['round']:
                 self._populations.append(self._extract_population())
                 self.state['round'] += 1
@@ -976,7 +874,7 @@ class BayesianOptimization(ParameterInference):
     # TODO: use state dict
     @property
     def _n_submitted_evidence(self):
-        return self.batches.total * self.batch_size
+        return self.batch_handler.total * self.batch_size
 
     def _allow_submit(self, batch_index):
         if not super(BayesianOptimization, self)._allow_submit(batch_index):
@@ -993,7 +891,7 @@ class BayesianOptimization(ParameterInference):
         # Do not allow acquisition until previous acquisitions are ready (as well
         # as all initial acquisitions)
         acquisitions_left = len(self.state['acquisition'])
-        if acquisitions_left == 0 and self.batches.has_pending:
+        if acquisitions_left == 0 and self.batch_handler.has_pending:
             return False
 
         return True

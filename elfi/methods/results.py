@@ -9,6 +9,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 
 import elfi.visualization.visualization as vis
+from elfi.utils import is_array
 
 logger = logging.getLogger(__name__)
 
@@ -16,25 +17,23 @@ logger = logging.getLogger(__name__)
 class ParameterInferenceResult:
     """Base class for results."""
 
-    def __init__(self, method_name, outputs, parameter_names, **kwargs):
+    def __init__(self, outputs, parameter_names, n_sim, method_name, **kwargs):
         """Initialize result.
 
         Parameters
         ----------
-        method_name : string
-            Name of inference method.
         outputs : dict
             Dictionary with outputs from the nodes, e.g. samples.
         parameter_names : list
             Names of the parameter nodes
-        **kwargs
-            Any other information from the inference algorithm, usually from it's state.
+        method_name : string
+            Name of inference method.
 
         """
-        self.method_name = method_name
         self.outputs = outputs.copy()
-        self.parameter_names = parameter_names
-        self.meta = kwargs
+        self.parameter_names = parameter_names  # type: list
+        self.n_sim = n_sim
+        self.method_name = method_name
 
 
 class OptimizationResult(ParameterInferenceResult):
@@ -55,63 +54,19 @@ class OptimizationResult(ParameterInferenceResult):
         self.x_min = x_min
 
 
-class Sample(ParameterInferenceResult):
-    """Sampling results from inference methods."""
+class OutputSampleMixin:
+    """Add sample specific common properties to sample like classes.
 
-    def __init__(self,
-                 method_name,
-                 outputs,
-                 parameter_names,
-                 discrepancy_name=None,
-                 weights=None,
-                 **kwargs):
-        """Initialize result.
+    Notes
+    -----
+    The following attributes must be present in the class that adopts this mixin:
 
-        Parameters
-        ----------
-        method_name : string
-            Name of inference method.
-        outputs : dict
-            Dictionary with outputs from the nodes, e.g. samples.
-        parameter_names : list
-            Names of the parameter nodes
-        discrepancy_name : string, optional
-            Name of the discrepancy in outputs.
-        weights : array_like
-        **kwargs
-            Other meta information for the result
+    outputs : dict
+    parameter_names : tuple
+    discrepancy_name : str
+    n_sim : int
 
-        """
-        super(Sample, self).__init__(
-            method_name=method_name, outputs=outputs, parameter_names=parameter_names, **kwargs)
-
-        self.samples = OrderedDict()
-        for n in self.parameter_names:
-            self.samples[n] = self.outputs[n]
-
-        self.discrepancy_name = discrepancy_name
-        self.weights = weights
-
-    def __getattr__(self, item):
-        """Allow more convenient access to items under self.meta."""
-        if item in self.meta.keys():
-            return self.meta[item]
-        else:
-            raise AttributeError("No attribute '{}' in this sample".format(item))
-
-    def __dir__(self):
-        """Allow autocompletion for items under self.meta.
-
-        http://stackoverflow.com/questions/13603088/python-dynamic-help-and-autocomplete-generation
-        """
-        items = dir(type(self)) + list(self.__dict__.keys())
-        items.extend(self.meta.keys())
-        return items
-
-    @property
-    def n_samples(self):
-        """Return the number of samples."""
-        return len(self.outputs[self.parameter_names[0]])
+    """
 
     @property
     def dim(self):
@@ -119,10 +74,71 @@ class Sample(ParameterInferenceResult):
         return len(self.parameter_names)
 
     @property
+    def accept_rate(self):
+        return min(1.0, self.n_samples / self.n_sim)
+
+    @property
     def discrepancies(self):
-        """Return the discrepancy values."""
-        return None if self.discrepancy_name is None else \
-            self.outputs[self.discrepancy_name]
+        return self.outputs[self.discrepancy_name]
+
+    @property
+    def meta(self):
+        return self.threshold, self.accept_rate, self.n_samples, self.n_sim
+
+    @property
+    def meta_names(self):
+        return ('threshold', 'accept_rate', 'n_samples', 'n_sim')
+
+    @property
+    def n_samples(self):
+        return len(self.discrepancies)
+
+    @property
+    def threshold(self):
+        return self.discrepancies[-1]
+
+
+class Sample(OutputSampleMixin, ParameterInferenceResult):
+    """Sampling results from inference methods."""
+
+    def __init__(self,
+                 outputs,
+                 parameter_names,
+                 n_sim,
+                 method_name,
+                 discrepancy_name,
+                 weights=None
+                 ):
+        """Initialize result.
+
+        Parameters
+        ----------
+        outputs : dict
+            Dictionary with outputs from the nodes, e.g. samples.
+        parameter_names : list
+            Names of the parameter nodes
+        n_sim : int
+        method_name : string
+            Name of inference method.
+        discrepancy_name : string, optional
+            Name of the discrepancy in outputs.
+        weights : array_like
+        **kwargs
+            Other meta information for the result
+
+        """
+        super(Sample, self).__init__(outputs=outputs,
+                                     parameter_names=parameter_names,
+                                     n_sim=n_sim,
+                                     method_name=method_name,
+                                     )
+
+        self.samples = OrderedDict()
+        for n in self.parameter_names:
+            self.samples[n] = self.outputs[n]
+
+        self.discrepancy_name = discrepancy_name
+        self.weights = weights
 
     @property
     def samples_array(self):
@@ -388,3 +404,140 @@ class BolfiSample(Sample):
     def plot_traces(self, selector=None, axes=None, **kwargs):
         """Plot MCMC traces."""
         return vis.plot_traces(self, selector, axes, **kwargs)
+
+
+class OutputSampleCollector(OutputSampleMixin):
+
+    _index_key = '_index'
+
+    """Collects outputs with the smallest threshold."""
+    def __init__(self, output_names, parameter_names, batch_size, max_sample_size,
+                 discrepancy_name=None):
+        """
+
+        Parameters
+        ----------
+        output_names : tuple
+        parameter_names : tuple
+        batch_size : int
+        max_sample_size : int
+        discrepancy_name : str, optional
+            Specify the discrepancy name in output_names. Default is the first name in
+            output_names.
+
+        """
+        super(OutputSampleCollector, self).__init__()
+
+        self.output_names = tuple(output_names) + (self._index_key,)
+        self.parameter_names = tuple(parameter_names)
+        self.discrepancy_name = discrepancy_name or self.output_names[0]
+        self.batch_size = batch_size
+        self.max_sample_size = max_sample_size
+
+        self._outputs = {}
+        self.n_batches = 0
+
+    @property
+    def n_sim(self):
+        return self.n_batches * self.batch_size
+
+    @property
+    def outputs(self):
+        return self.outputs_at(self.max_sample_size)
+
+    def _init_outputs(self, batch):
+        for output_name in self.output_names:
+
+            if output_name not in batch:
+                raise KeyError("Did not receive outputs for node {}".format(output_name))
+
+            b = batch[output_name]
+            if not is_array(b):
+                raise ValueError('Output from node {} is not a numpy array. Please ensure that '
+                                 'the corresponding node always returns numpy arrays.'
+                                 .format(output_name))
+            elif len(b) != self.batch_size:
+                raise ValueError('Output from node {} returned outputs with length {}, '
+                                 'but should have returned {} outputs (batch_size). Please ensure'
+                                 'that the node returns a proper number of outputs'
+                                 .format(output_name, len(b), self.batch_size))
+
+            # Prepare the arrays
+            shape = (self.max_sample_size + self.batch_size, ) + b.shape[1:]
+            dtype = b.dtype
+            self._outputs[output_name] = np.empty(shape, dtype=dtype)
+
+            # Initialize distances with inf:s
+            if output_name == self.discrepancy_name:
+                self._outputs[output_name][:] = np.inf
+            elif output_name == self._index_key:
+                self._outputs[output_name][:] = np.nan
+
+    def add_batch(self, batch, batch_index):
+        """Collects outputs below current_threshold from the given batch.
+
+        Parameters
+        ----------
+        batch : dict
+        batch_index : int
+
+        Returns
+        -------
+        None
+        """
+
+        # Add the indexes
+        batch[self._index_key] = np.arange(batch_index,
+                                           batch_index + self.batch_size,
+                                           dtype=np.uint64)
+
+        if not self._outputs:
+            self._init_outputs(batch)
+
+        for output_name, values in self._outputs.items():
+            values[-self.batch_size:] = batch[output_name]
+
+        sort_indices = np.argsort(self._outputs[self.discrepancy_name], axis=None)
+        for values in self._outputs.values():
+            values[:] = values[sort_indices]
+
+        self.n_batches += 1
+
+    def threshold_at(self, sample_size):
+        return self.discrepancies[sample_size - 1].item()
+
+    def accept_rate_at(self, sample_size):
+        return min(1.0, sample_size / self.n_sim)
+
+    def outputs_at(self, sample_size, sorted=True):
+        """Return outputs for the given sample size.
+
+        Parameters
+        ----------
+        sample_size : int, optional
+            Default is the ``self.max_sample_size``.
+        sorted : bool
+            Return samples sorted by the threshold. Default is True. If false, will
+            return a copy in the order they were sampled.
+
+        Returns
+        -------
+        dict
+
+        """
+        if sample_size > self.max_sample_size:
+            raise ValueError("The maximum sample size is {}, requested size was {}"
+                             .format(self.max_sample_size, sample_size))
+
+        outputs = {}
+        for output_name, values in self._outputs.items():
+            outputs[output_name] = values[:sample_size]
+
+        if sorted is False:
+            # Put the samples in the original order
+            sort_indices = np.argsort(outputs[self._index_key], axis=None)
+            for values in outputs.values():
+                # Advanced indexing returns a copy
+                values[:] = values[sort_indices]
+
+        return outputs
