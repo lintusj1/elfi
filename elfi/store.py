@@ -119,6 +119,22 @@ class OutputPool:
         if self.name is None:
             self.name = "{}_{}".format(self.__class__.__name__.lower(), self.seed)
 
+    def outputs_at(self, index):
+        """Return the outputs for the simulation index
+
+        Parameters
+        ----------
+        index : int
+
+        Returns
+        -------
+        dict
+        """
+        batch_index = index // self.batch_size
+        index_in_batch = index % self.batch_size
+        batch = self.get_batch(batch_index)
+        return {k: v[index_in_batch] for k, v in batch.items()}
+
     def get_batch(self, batch_index, output_names=None):
         """Return a batch from the stores of the pool.
 

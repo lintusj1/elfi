@@ -95,7 +95,7 @@ class OutputSampleMixin:
 
     @property
     def threshold(self):
-        return np.min(self.discrepancies).item()
+        return np.max(self.discrepancies).item()
 
 
 class Sample(OutputSampleMixin, ParameterInferenceResult):
@@ -487,9 +487,8 @@ class OutputSampleCollector(OutputSampleMixin):
         """
 
         # Add the indexes
-        batch[self._index_key] = np.arange(batch_index,
-                                           batch_index + self.batch_size,
-                                           dtype=np.uint64)
+        a = batch_index * self.batch_size
+        batch[self._index_key] = np.arange(a, a + self.batch_size, dtype=np.uint64)
 
         if not self._outputs:
             self._init_outputs(batch)
