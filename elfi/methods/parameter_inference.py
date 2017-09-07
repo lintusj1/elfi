@@ -397,7 +397,9 @@ class Rejection(ABCSampler):
         elif n_sim is not None:
             threshold = np.inf
         else:
-            raise ValueError('No threshold, quantile or n_sim provided.')
+            threshold = np.inf
+            # Corresponds to a 0.01 quantile
+            n_sim = n_samples * 100
 
         while self.iterate(n_sim):
             # If threshold, keep simulating until the threshold is reached

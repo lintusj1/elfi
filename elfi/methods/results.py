@@ -407,10 +407,10 @@ class BolfiSample(Sample):
 
 
 class OutputSampleCollector(OutputSampleMixin):
+    """Collects outputs with the smallest threshold."""
 
     _index_key = '_index'
 
-    """Collects outputs with the smallest threshold."""
     def __init__(self, output_names, parameter_names, batch_size, max_sample_size,
                  discrepancy_name=None):
         """
