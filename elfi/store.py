@@ -88,6 +88,14 @@ class OutputPool:
         """Check if current pool has context information."""
         return self.seed is not None and self.batch_size is not None
 
+    @property
+    def n_batches(self):
+        return len(self)
+
+    @property
+    def n_sim(self):
+        return self.n_batches * self.batch_size
+
     def set_context(self, context):
         """Set the context of the pool.
 

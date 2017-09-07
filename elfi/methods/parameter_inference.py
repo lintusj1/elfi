@@ -100,7 +100,7 @@ class ParameterInference:
                                                       output_names=output_names,
                                                       client=self.client)
         self.max_parallel_batches = max_parallel_batches or self.client.num_cores or 1
-        self.n_sim = 0
+        self.n_batches = 0
 
         if self.max_parallel_batches < 1:
             raise ValueError('The value of max_parallel_batches must be at least 1.')
@@ -127,6 +127,10 @@ class ParameterInference:
     def batch_size(self):
         """Return the current batch_size."""
         return self.context.batch_size
+
+    @property
+    def n_sim(self):
+        return self.n_batches * self.batch_size
 
     def iterate(self, total_limit=None):
         """Advance the inference by one iteration.
@@ -166,6 +170,7 @@ class ParameterInference:
         # Wait and handle the next ready batch in succession
         batch, batch_index = self.batch_handler.wait_next()
 
+        self.n_batches += 1
         logger.info('Processing batch %d' % batch_index)
         self.update(batch, batch_index)
 
@@ -202,7 +207,6 @@ class ParameterInference:
         None
 
         """
-        self.n_sim += self.batch_size
 
     def prepare_new_batch(self, batch_index):
         """Prepare values for a new batch.
@@ -365,7 +369,7 @@ class Rejection(ABCSampler):
         super(Rejection, self).__init__(model, output_names, **kwargs)
 
         self.discrepancy_name = discrepancy_name
-        self.max_sample_size = max(self.batch_size, max(sample_sizes or [1000]))
+        self.max_sample_size = max(self.batch_size, max(sample_sizes or [10000]))
         self.sample_sizes = sample_sizes or [1, self.max_sample_size]  # type: list
         self.sample_points = OutputSampleCollector(self.output_names,
                                                    self.parameter_names,

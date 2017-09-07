@@ -95,7 +95,7 @@ class OutputSampleMixin:
 
     @property
     def threshold(self):
-        return self.discrepancies[-1]
+        return np.min(self.discrepancies).item()
 
 
 class Sample(OutputSampleMixin, ParameterInferenceResult):
@@ -531,13 +531,15 @@ class OutputSampleCollector(OutputSampleMixin):
 
         outputs = {}
         for output_name, values in self._outputs.items():
-            outputs[output_name] = values[:sample_size]
+            values_ = values[:sample_size]
+            if sorted is False:
+                values_ = values_.copy()
+            outputs[output_name] = values_
 
         if sorted is False:
             # Put the samples in the original order
             sort_indices = np.argsort(outputs[self._index_key], axis=None)
             for values in outputs.values():
-                # Advanced indexing returns a copy
                 values[:] = values[sort_indices]
 
         return outputs
