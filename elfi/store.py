@@ -14,10 +14,78 @@ logger = logging.getLogger(__name__)
 _default_prefix = 'pools'
 
 
+# TODO: add tests
+class BatchCombiner:
+    def __init__(self, store, batch_size):
+        self.store = store
+        self.batch_size = batch_size
+
+    def _normalize_slice(self, sl):
+        if sl.step is not None and sl.step != 1:
+            raise ValueError("Slice steps are not supported")
+
+        start = sl.start
+        if start is None:
+            start = 0
+        elif start < 0:
+            start = len(self.store)*self.batch_size + start
+
+        stop = sl.stop
+        if stop is None:
+            stop = len(self.store)*self.batch_size
+        elif stop < 0:
+            stop = len(self.store)*self.batch_size + stop
+
+        return slice(start, stop)
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            item = self._normalize_slice(item)
+
+            b0 = item.start // self.batch_size
+            b1 = (item.stop - 1) // self.batch_size
+
+            combined = None
+            names_to_append = None
+            for i in range(b0, b1+1):
+                b = self.store[i]
+                # Take the names from the first batch
+                if i == b0:
+                    names_to_append = list(b.keys())
+                    combined = {name: [] for name in names_to_append}
+                for ii in reversed(range(len(names_to_append))):
+                    name = names_to_append[ii]
+                    if name not in b:
+                        # If the name is not present, remove it from future appends
+                        del names_to_append[ii]
+                        continue
+                    combined[name].append(b[name])
+
+            a0 = item.start % self.batch_size
+            a1 = a0 + (item.stop - item.start)
+            for name in list(combined):
+                combined[name] = np.concatenate(combined[name], 0)[a0:a1]
+
+            return combined
+
+        else:
+            batch_index = item // self.batch_size
+            index_in_batch = item % self.batch_size
+            batch = self.store[batch_index]
+            return {k: v[index_in_batch] for k, v in batch.items()}
+
+
+# TODO: rename outputs parameter
 class OutputPool:
     """Store node outputs to dictionary-like stores.
 
     The default store is a Python dictionary.
+
+    Attributes
+    ----------
+
+    outputs : BatchCombiner, None
+        Allows querying outputs by their simulation indexes
 
     Notes
     -----
@@ -38,21 +106,22 @@ class OutputPool:
         """Initialize OutputPool.
 
         Depending on the algorithm, some of these values may be reused
-        after making some changes to `ElfiModel` thus speeding up the inference
-        significantly. For instance, if all the simulations are stored in Rejection
-        sampling, one can change the summaries and distances without having to rerun
-        the simulator.
+        after making some changes to `ElfiModel` thus speeding up the
+        inference significantly. For instance, if all the simulations are
+        stored in Rejection sampling, one can change the summaries and
+        distances without having to rerun the simulator.
 
         Parameters
         ----------
         outputs : list, dict, optional
-            List of node names which to store or a dictionary with existing stores. The
-            stores are created on demand.
+            List of node names whose outputs to store. Optionally can be
+            a dictionary with existing stores. The stores are created on
+            demand.
         name : str, optional
             Name of the pool. Used to open a saved pool from disk.
         prefix : str, optional
-            Path to directory under which `elfi.ArrayPool` will place its folder.
-            Default is a relative path ./pools.
+            Path to directory under which `elfi.ArrayPool` will place its
+            folder. Default is a relative path ./pools.
 
         Returns
         -------
@@ -67,6 +136,7 @@ class OutputPool:
             stores = dict.fromkeys(outputs)
 
         self.stores = stores
+        self.outputs = None
 
         # Context information
         self.batch_size = None
@@ -115,6 +185,8 @@ class OutputPool:
 
         self.batch_size = context.batch_size
         self.seed = context.seed
+
+        self.outputs = BatchCombiner(self, self.batch_size)
 
         if self.name is None:
             self.name = "{}_{}".format(self.__class__.__name__.lower(), self.seed)
