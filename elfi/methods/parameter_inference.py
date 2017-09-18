@@ -155,7 +155,7 @@ class ParameterInference:
 
 
         """
-        total_limit = total_limit or np.inf
+        total_limit = np.inf if total_limit is None else total_limit
         if self.n_sim >= total_limit:
             return False
 

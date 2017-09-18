@@ -559,7 +559,8 @@ class ArrayStore(StoreBase):
         """
         if n_batches == -1:
             if len(array) % batch_size != 0:
-                logger.warning("The array length is not divisible by the batch size.")
+                logger.warning("The array length is not divisible by the batch size. Excess "
+                               "values will be overwritten if array is appended.")
             n_batches = len(array) // batch_size
 
         self.array = array
@@ -627,10 +628,6 @@ class ArrayStore(StoreBase):
         """Close array."""
         if hasattr(self.array, 'close'):
             self.array.close()
-
-    def __del__(self):
-        """Close array."""
-        self.close()
 
 
 class NpyStore(ArrayStore):

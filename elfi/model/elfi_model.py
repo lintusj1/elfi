@@ -82,7 +82,7 @@ def new_model(name=None, set_default=True):
     return model
 
 
-def load_model(name, prefix=None, set_default=True):
+def load_model(filename=None, set_default=True):
     """Load the pickled ElfiModel.
 
     Assumes there exists a file "name.pkl" in the current directory. Also sets the loaded
@@ -90,10 +90,8 @@ def load_model(name, prefix=None, set_default=True):
 
     Parameters
     ----------
-    name : str
-        Name of the model file to load (without the .pkl extension).
-    prefix : str
-        Path to directory where the model file is located, optional.
+    filename : str
+        Filename of the model file to load.
     set_default : bool, optional
         Set the loaded model as the default model. Default is True.
 
@@ -102,7 +100,7 @@ def load_model(name, prefix=None, set_default=True):
     ElfiModel
 
     """
-    model = ElfiModel.load(name, prefix=prefix)
+    model = ElfiModel.load(filename)
     if set_default:
         set_default_model(model)
     return model
@@ -391,44 +389,41 @@ class ElfiModel(GraphicalModel):
         kopy.name = "{}_copy_{}".format(self.name, random_name())
         return kopy
 
-    def save(self, prefix=None):
+    def save(self, filename=None):
         """Save the current model to pickled file.
 
         Parameters
         ----------
-        prefix : str, optional
-            Path to the directory under which to save the model. Default is the current working
+        filename : str, optional
+            Path to save the model. Default is {model_name}.pkl under the current working
             directory.
 
         """
-        path = self.name + '.pkl'
-        if prefix is not None:
-            os.makedirs(prefix, exist_ok=True)
-            path = os.path.join(prefix, path)
-        pickle.dump(self, open(path, "wb"))
+
+        if filename:
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+        else:
+            filename = self.name + '.pkl'
+
+        pickle.dump(self, open(filename, "wb"))
 
     @classmethod
-    def load(cls, name, prefix):
+    def load(cls, filename):
         """Load the pickled ElfiModel.
 
         Assumes there exists a file "name.pkl" in the current directory.
 
         Parameters
         ----------
-        name : str
-            Name of the model file to load (without the .pkl extension).
-        prefix : str
-            Path to directory where the model file is located, optional.
+        filename : str
+            Model filename.
 
         Returns
         -------
         ElfiModel
 
         """
-        path = name + '.pkl'
-        if prefix is not None:
-            path = os.path.join(prefix, path)
-        return pickle.load(open(path, "rb"))
+        return pickle.load(open(filename, "rb"))
 
     def __getitem__(self, node_name):
         """Return a new reference object for a node in the model.
